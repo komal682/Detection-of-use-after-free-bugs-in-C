@@ -5,11 +5,6 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <elf.h>
-#include <assert.h>
 #include <pthread.h>
 #include "memory.h"
 
@@ -17,7 +12,6 @@ typedef unsigned long long ulong64;
 #define NUM_SIZE_CLASSES 10
 #define SEGMENT_SIZE (4ULL << 30)
 #define PAGE_SIZE 4096
-#define COMMIT_SIZE PAGE_SIZE
 #define BITS_TO_BYTES(x) (((x) + 7) / 8)
 #define Align(x, y) (((x) + (y-1)) & ~(y-1))
 #define ADDR_TO_PAGE(x) (char*)(((ulong64)(x)) & ~(PAGE_SIZE-1))
@@ -28,68 +22,50 @@ long long NumBytesFreed = 0;
 long long NumBytesAllocated = 0;
 
 static const size_t SizeClasses[NUM_SIZE_CLASSES] = {
-    8, 16, 32, 64, 128,
-    256, 512, 1024, 2048, 4096
-};
-
-static inline unsigned char *get_slot_bitmap(void *page_start) {
-    return (unsigned char *)page_start;
-}
-
-static inline int is_slot_used(unsigned char *bm, int slot) {
-    return bm[slot / 8] & (1 << (slot % 8));
-}
-
-static inline void set_slot_used(unsigned char *bm, int slot) {
-    bm[slot / 8] |= (1 << (slot % 8));
-}
-
-static inline void clear_slot_used(unsigned char *bm, int slot) {
-    bm[slot / 8] &= ~(1 << (slot % 8));
-}
-
-static inline size_t slot_bitmap_bytes(size_t slots) {
-    return BITS_TO_BYTES(slots);
-}
-
-struct OtherMetadata {
-    char *AllocPtr;
-    char *CommitPtr;
-    char *ReservePtr;
-    char *DataPtr;
-    int BigAlloc;
+    8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096
 };
 
 typedef struct Segment {
-    struct OtherMetadata Other;
-    size_t object_size;        
-    size_t objects_per_page;   
-    unsigned char *byte_map;     
+    size_t object_size;
+    size_t objects_per_page;
     struct Segment *Next;
+    unsigned char *byte_map;
+    unsigned char *slot_bitmaps;
+    size_t slot_bitmap_size;
+    char *data_start;
+    char *data_end;
+    size_t num_data_pages;
+    int is_big_alloc;
+    pthread_mutex_t lock;
 } Segment;
 
 static Segment *SizeClassSegments[NUM_SIZE_CLASSES] = {NULL};
+static pthread_mutex_t global_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void setDataPtr(Segment *Seg, char *Ptr) { Seg->Other.DataPtr = Ptr; }
-static void setAllocPtr(Segment *Seg, char *Ptr) { Seg->Other.AllocPtr = Ptr; }
-static void setCommitPtr(Segment *Seg, char *Ptr) { Seg->Other.CommitPtr = Ptr; }
-static void setReservePtr(Segment *Seg, char *Ptr) { Seg->Other.ReservePtr = Ptr; }
-static char* getDataPtr(Segment *Seg) { return Seg->Other.DataPtr; }
-static char* getAllocPtr(Segment *Seg) { return Seg->Other.AllocPtr; }
-static char* getCommitPtr(Segment *Seg) { return Seg->Other.CommitPtr; }
-static char* getReservePtr(Segment *Seg) { return Seg->Other.ReservePtr; }
-static void setBigAlloc(Segment *Seg, int BigAlloc) { Seg->Other.BigAlloc = BigAlloc; }
-void consolidate_sparse_pages(Segment *Seg);
+static inline unsigned char *get_page_slot_bitmap(Segment *Seg, size_t page_index) {
+    return Seg->slot_bitmaps + (page_index * Seg->slot_bitmap_size);
+}
 
+static inline int is_slot_used(unsigned char *bm, size_t slot) {
+    return bm[slot / 8] & (1 << (slot % 8));
+}
 
-static void addToSizeClassList(int cls, Segment *Seg) {
-    Seg->Next = SizeClassSegments[cls];
-    SizeClassSegments[cls] = Seg;
+static inline void set_slot_used(unsigned char *bm, size_t slot) {
+    bm[slot / 8] |= (1 << (slot % 8));
+}
+
+static inline void clear_slot_used(unsigned char *bm, size_t slot) {
+    bm[slot / 8] &= ~(1 << (slot % 8));
+}
+
+static inline void *get_object_addr(Segment *Seg, size_t page_index, size_t slot_index) {
+    char *page_start = Seg->data_start + (page_index * PAGE_SIZE);
+    return page_start + (slot_index * Seg->object_size);
 }
 
 static void allowAccess(void *Ptr, size_t Size) {
-    int Ret = mprotect(Ptr, Size, PROT_READ|PROT_WRITE);
-    if (Ret == -1) {
+    if (mprotect(Ptr, Size, PROT_READ | PROT_WRITE) == -1) {
+        perror("mprotect allow");
         exit(1);
     }
 }
@@ -99,93 +75,83 @@ static void reclaimMemory(void *Ptr, size_t Size) {
     madvise(Ptr, Size, MADV_DONTNEED);
 }
 
-static Segment* allocateSegment(int BigAlloc, int cls) {
-    void *Base = mmap(NULL, SEGMENT_SIZE * 2, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
-    if (Base == MAP_FAILED) exit(1);
+static Segment* allocateSegment(int cls) {
+    void *Base = mmap(NULL, SEGMENT_SIZE * 2, PROT_NONE,
+                      MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (Base == MAP_FAILED) {
+        perror("mmap segment");
+        return NULL;
+    }
 
     Segment *Seg = (Segment*)Align((ulong64)Base, SEGMENT_SIZE);
     allowAccess(Seg, PAGE_SIZE);
+    memset(Seg, 0, sizeof(Segment));
 
     char *SegmentStart = (char*)Seg;
     char *SegmentEnd = SegmentStart + SEGMENT_SIZE;
 
-    setDataPtr(Seg, SegmentStart);
-    setAllocPtr(Seg, SegmentStart);     
-    setCommitPtr(Seg, SegmentStart);
-    setReservePtr(Seg, SegmentEnd);
-    setBigAlloc(Seg, BigAlloc);
-
     Seg->object_size = SizeClasses[cls];
-    size_t max_slots = PAGE_SIZE / Seg->object_size;
-    size_t bitmap_bytes = slot_bitmap_bytes(max_slots);
-    Seg->objects_per_page = (PAGE_SIZE - bitmap_bytes) / Seg->object_size;
-    
-    size_t num_pages = SEGMENT_SIZE / PAGE_SIZE;
-    size_t bytemap_needed = Align(num_pages, PAGE_SIZE);
-    Seg->byte_map = (unsigned char *)(SegmentEnd - bytemap_needed);
+    Seg->is_big_alloc = 0;
+    pthread_mutex_init(&Seg->lock, NULL);
 
-    allowAccess(Seg->byte_map, bytemap_needed);
+    Seg->objects_per_page = PAGE_SIZE / Seg->object_size;
+    Seg->slot_bitmap_size = BITS_TO_BYTES(Seg->objects_per_page);
 
-    for (size_t i = 0; i < num_pages; i++) {
+    size_t total_pages = SEGMENT_SIZE / PAGE_SIZE;
+    size_t byte_map_size = Align(total_pages, PAGE_SIZE);
+    size_t total_bitmaps_size = Align(Seg->slot_bitmap_size * total_pages, PAGE_SIZE);
+    size_t total_metadata = byte_map_size + total_bitmaps_size;
+
+    Seg->slot_bitmaps = (unsigned char*)(SegmentEnd - total_metadata);
+    Seg->byte_map = Seg->slot_bitmaps + total_bitmaps_size;
+
+    Seg->data_start = SegmentStart + PAGE_SIZE;
+    Seg->data_end = (char*)Seg->slot_bitmaps;
+    Seg->num_data_pages = (Seg->data_end - Seg->data_start) / PAGE_SIZE;
+
+    allowAccess(Seg->slot_bitmaps, total_metadata);
+
+    for (size_t i = 0; i < Seg->num_data_pages; i++) {
         Seg->byte_map[i] = (unsigned char)Seg->objects_per_page;
     }
 
-    addToSizeClassList(cls, Seg);
+    memset(Seg->slot_bitmaps, 0, total_bitmaps_size);
+
+    pthread_mutex_lock(&global_lock);
+    Seg->Next = SizeClassSegments[cls];
+    SizeClassSegments[cls] = Seg;
+    pthread_mutex_unlock(&global_lock);
+
     return Seg;
 }
 
-void myfree(void *Ptr) {
-    if (Ptr == NULL) return;
-
-    Segment *Seg = ADDR_TO_SEGMENT(Ptr);
-    
-    if (Seg->Other.BigAlloc) {
-        size_t *sz_ptr = (size_t*)Ptr - 1;
-        size_t actual_size = *sz_ptr;
-        NumBytesFreed += actual_size;
-        munmap((char*)Ptr - PAGE_SIZE, actual_size + PAGE_SIZE);
-        return;
-    }
-
-    char *page_start = ADDR_TO_PAGE(Ptr);
-    size_t page_index = (page_start - getDataPtr(Seg)) / PAGE_SIZE;
-    unsigned char *slot_bm = get_slot_bitmap(page_start);
-    size_t bitmap_bytes = slot_bitmap_bytes(PAGE_SIZE / Seg->object_size);
-    char *obj_base = page_start + bitmap_bytes;
-    size_t slot_index = ((char *)Ptr - obj_base) / Seg->object_size;
-
-    if (is_slot_used(slot_bm, slot_index)) {
-        clear_slot_used(slot_bm, slot_index);
-        Seg->byte_map[page_index]++;
-		if (NumBytesFreed % (SEGMENT_SIZE / 1024) == 0) { 
-    		consolidate_sparse_pages(Seg);
-		}
-        NumBytesFreed += Seg->object_size;
-
-        if (Seg->byte_map[page_index] == Seg->objects_per_page) {
-            reclaimMemory(page_start, PAGE_SIZE);
-        }
-    }
-}
-
 static void* BigAlloc(size_t Size) {
-    size_t TotalSize = Align(Size + PAGE_SIZE, PAGE_SIZE);
-    void *Ptr = mmap(NULL, TotalSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-    if (Ptr == MAP_FAILED) return NULL;
+    size_t TotalSize = Align(Size + sizeof(Segment) + sizeof(size_t), PAGE_SIZE);
+    void *Ptr = mmap(NULL, TotalSize, PROT_READ | PROT_WRITE,
+                     MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (Ptr == MAP_FAILED) {
+        perror("mmap big alloc");
+        return NULL;
+    }
 
-    Segment *DummySeg = (Segment*)Ptr;
-    setBigAlloc(DummySeg, 1);
-    
-    size_t *sz_ptr = (size_t*)((char*)Ptr + PAGE_SIZE);
-    *(sz_ptr - 1) = Size;
+    Segment *Meta = (Segment*)Ptr;
+    memset(Meta, 0, sizeof(Segment));
+    Meta->is_big_alloc = 1;
 
-    NumBytesAllocated += TotalSize;
-    return (void*)sz_ptr;
+    size_t *size_ptr = (size_t*)((char*)Ptr + sizeof(Segment));
+    *size_ptr = TotalSize;
+
+    __sync_fetch_and_add(&NumBytesAllocated, TotalSize);
+
+    return (char*)Ptr + sizeof(Segment) + sizeof(size_t);
 }
 
 void *_mymalloc(size_t Size) {
     if (Size == 0) return NULL;
-    if (Size > SizeClasses[NUM_SIZE_CLASSES - 1]) return BigAlloc(Size);
+
+    if (Size > SizeClasses[NUM_SIZE_CLASSES - 1]) {
+        return BigAlloc(Size);
+    }
 
     int cls = -1;
     for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
@@ -195,103 +161,281 @@ void *_mymalloc(size_t Size) {
         }
     }
 
+    pthread_mutex_lock(&global_lock);
     Segment *Seg = SizeClassSegments[cls];
+    pthread_mutex_unlock(&global_lock);
+
     while (Seg) {
-        size_t num_pages = SEGMENT_SIZE / PAGE_SIZE;
-        for (size_t p = 1; p < num_pages - 1; p++) {
+        pthread_mutex_lock(&Seg->lock);
+
+        for (size_t p = 0; p < Seg->num_data_pages; p++) {
             if (Seg->byte_map[p] == 0) continue;
 
-            char *page_start = getDataPtr(Seg) + p * PAGE_SIZE;
-            unsigned char *bm = get_slot_bitmap(page_start);
-            size_t bm_bytes = slot_bitmap_bytes(PAGE_SIZE / Seg->object_size);
+            char *page_start = Seg->data_start + (p * PAGE_SIZE);
+            unsigned char *slot_bm = get_page_slot_bitmap(Seg, p);
 
             if (Seg->byte_map[p] == Seg->objects_per_page) {
                 allowAccess(page_start, PAGE_SIZE);
-                memset(bm, 0, bm_bytes);
             }
 
-            char *obj_base = page_start + bm_bytes;
             for (size_t s = 0; s < Seg->objects_per_page; s++) {
-                if (!is_slot_used(bm, s)) {
-                    set_slot_used(bm, s);
+                if (!is_slot_used(slot_bm, s)) {
+                    set_slot_used(slot_bm, s);
                     Seg->byte_map[p]--;
-                    NumBytesAllocated += Seg->object_size;
-                    return obj_base + s * Seg->object_size;
+                    __sync_fetch_and_add(&NumBytesAllocated, Seg->object_size);
+
+                    void *obj = get_object_addr(Seg, p, s);
+                    pthread_mutex_unlock(&Seg->lock);
+                    return obj;
                 }
             }
         }
+
+        pthread_mutex_unlock(&Seg->lock);
         Seg = Seg->Next;
     }
 
-    allocateSegment(0, cls);
+    Seg = allocateSegment(cls);
+    if (!Seg) return NULL;
     return _mymalloc(Size);
 }
 
-void consolidate_mremap(void *src_page, void *dst_page) {
-    mremap(src_page, PAGE_SIZE, PAGE_SIZE, MREMAP_MAYMOVE | MREMAP_FIXED, dst_page);
+static int pages_have_overlap(Segment *Seg, size_t page1_idx, size_t page2_idx) {
+    unsigned char *bm1 = get_page_slot_bitmap(Seg, page1_idx);
+    unsigned char *bm2 = get_page_slot_bitmap(Seg, page2_idx);
+    
+    for (size_t s = 0; s < Seg->objects_per_page; s++) {
+        if (is_slot_used(bm1, s) && is_slot_used(bm2, s)) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
-void consolidate_sparse_pages(Segment *Seg) {
-    size_t num_pages = SEGMENT_SIZE / PAGE_SIZE;
-    size_t bytemap_needed = Align(num_pages, PAGE_SIZE);
-    size_t last_usable_page = num_pages - (bytemap_needed / PAGE_SIZE) - 1;
+static size_t merge_pages(Segment *Seg, size_t dst_page_idx, size_t src_page_idx) {
+    unsigned char *dst_bm = get_page_slot_bitmap(Seg, dst_page_idx);
+    unsigned char *src_bm = get_page_slot_bitmap(Seg, src_page_idx);
+    
+    char *dst_page = Seg->data_start + (dst_page_idx * PAGE_SIZE);
+    char *src_page = Seg->data_start + (src_page_idx * PAGE_SIZE);
+    
+    if (Seg->byte_map[dst_page_idx] == Seg->objects_per_page) {
+        allowAccess(dst_page, PAGE_SIZE);
+    }
+    if (Seg->byte_map[src_page_idx] == Seg->objects_per_page) {
+        allowAccess(src_page, PAGE_SIZE);
+    }
+    
+    size_t objects_copied = 0;
+    
+    for (size_t s = 0; s < Seg->objects_per_page; s++) {
+        if (is_slot_used(src_bm, s)) {
+            void *src_obj = src_page + (s * Seg->object_size);
+            void *dst_obj = dst_page + (s * Seg->object_size);
+            
+            memcpy(dst_obj, src_obj, Seg->object_size);
+            
+            set_slot_used(dst_bm, s);
+            clear_slot_used(src_bm, s);
+            
+            Seg->byte_map[dst_page_idx]--;
+            Seg->byte_map[src_page_idx]++;
+            
+            objects_copied++;
+        }
+    }
+    
+    return objects_copied;
+}
 
-    for (size_t i = 1; i < last_usable_page; i++) {
-        if (Seg->byte_map[i] == Seg->objects_per_page || Seg->byte_map[i] == 0) {
+static void consolidate_segment(Segment *Seg) {
+    if (!Seg || Seg->num_data_pages < 2) return;
+    
+    pthread_mutex_lock(&Seg->lock);
+    
+    size_t pages_consolidated = 0;
+    size_t total_objects_moved = 0;
+    
+    for (size_t page1 = 0; page1 < Seg->num_data_pages; page1++) {
+        size_t page1_used = Seg->objects_per_page - Seg->byte_map[page1];
+        
+        if (page1_used == 0 || page1_used == Seg->objects_per_page) {
             continue;
         }
-
-        for (size_t j = i + 1; j < last_usable_page; j++) {
-            if (Seg->byte_map[j] == Seg->objects_per_page || Seg->byte_map[j] == 0) {
+        
+        for (size_t page2 = page1 + 1; page2 < Seg->num_data_pages; page2++) {
+            size_t page2_used = Seg->objects_per_page - Seg->byte_map[page2];
+            
+            if (page2_used == 0 || page2_used == Seg->objects_per_page) {
                 continue;
             }
-
-            size_t used_i = Seg->objects_per_page - Seg->byte_map[i];
-            size_t used_j = Seg->objects_per_page - Seg->byte_map[j];
-
-            if (used_i + used_j <= Seg->objects_per_page) {
-                void *src_addr = getDataPtr(Seg) + (j * PAGE_SIZE);
-                void *dst_addr = getDataPtr(Seg) + (i * PAGE_SIZE);
-
-                unsigned char *src_bm = get_slot_bitmap(src_addr);
-                unsigned char *dst_bm = get_slot_bitmap(dst_addr);
-                size_t bm_bytes = slot_bitmap_bytes(Seg->objects_per_page);
-
-                for (size_t s = 0; s < Seg->objects_per_page; s++) {
-                    if (is_slot_used(src_bm, s)) {
-                        size_t bm_offset = slot_bitmap_bytes(PAGE_SIZE / Seg->object_size);
-                        void *src_obj = (char*)src_addr + bm_offset + (s * Seg->object_size);
-                        
-                        for (size_t d = 0; d < Seg->objects_per_page; d++) {
-                            if (!is_slot_used(dst_bm, d)) {
-                                void *dst_obj = (char*)dst_addr + bm_offset + (d * Seg->object_size);
-                                memcpy(dst_obj, src_obj, Seg->object_size);
-                                set_slot_used(dst_bm, d);
-                                clear_slot_used(src_bm, s);
-                                Seg->byte_map[i]--;
-                                Seg->byte_map[j]++;
-                                break;
-                            }
-                        }
+            
+            size_t total_used = page1_used + page2_used;
+            
+            if (total_used <= Seg->objects_per_page) {
+                if (!pages_have_overlap(Seg, page1, page2)) {
+                    size_t dst_idx, src_idx;
+                    size_t objects_to_move;
+                    
+                    if (page1_used < page2_used) {
+                        src_idx = page1;
+                        dst_idx = page2;
+                        objects_to_move = page1_used;
+                    } else {
+                        src_idx = page2;
+                        dst_idx = page1;
+                        objects_to_move = page2_used;
                     }
+                    
+                    size_t moved = merge_pages(Seg, dst_idx, src_idx);
+                    total_objects_moved += moved;
+                    
+                    if (Seg->byte_map[src_idx] == Seg->objects_per_page) {
+                        char *src_page = Seg->data_start + (src_idx * PAGE_SIZE);
+                        reclaimMemory(src_page, PAGE_SIZE);
+                        pages_consolidated++;
+                    }
+                    
+                    break;
                 }
+            }
+        }
+    }
+    
+    pthread_mutex_unlock(&Seg->lock);
+    
+    if (pages_consolidated > 0) {
+        printf("Consolidated %zu pages (moved %zu objects) in segment (obj_size=%zu)\n", 
+               pages_consolidated, total_objects_moved, Seg->object_size);
+    }
+}
 
-                if (Seg->byte_map[j] == Seg->objects_per_page) {
-                    reclaimMemory(src_addr, PAGE_SIZE);
-                }
+static void consolidate_size_class(int cls) {
+    pthread_mutex_lock(&global_lock);
+    Segment *Seg = SizeClassSegments[cls];
+    pthread_mutex_unlock(&global_lock);
+    
+    while (Seg) {
+        consolidate_segment(Seg);
+        Seg = Seg->Next;
+    }
+}
+
+void myfree(void *Ptr) {
+    if (Ptr == NULL) return;
+
+    char *meta_base = (char*)Ptr - sizeof(Segment) - sizeof(size_t);
+    Segment *potential_seg = (Segment*)meta_base;
+    
+    Segment *Seg = ADDR_TO_SEGMENT(Ptr);
+    
+    if ((char*)Ptr >= (char*)Seg + sizeof(Segment) + sizeof(size_t) &&
+        (char*)Ptr < (char*)Seg + PAGE_SIZE &&
+        potential_seg == Seg && Seg->is_big_alloc) {
+        
+        size_t *size_ptr = (size_t*)((char*)Seg + sizeof(Segment));
+        size_t total_size = *size_ptr;
+        __sync_fetch_and_add(&NumBytesFreed, total_size);
+        munmap(Seg, total_size);
+        return;
+    }
+
+    pthread_mutex_lock(&Seg->lock);
+
+    char *page_start = ADDR_TO_PAGE(Ptr);
+    
+    if (page_start < Seg->data_start || page_start >= Seg->data_end) {
+        pthread_mutex_unlock(&Seg->lock);
+        fprintf(stderr, "Error: free() invalid pointer %p\n", Ptr);
+        return;
+    }
+
+    size_t page_index = (page_start - Seg->data_start) / PAGE_SIZE;
+    size_t offset_in_page = (char*)Ptr - page_start;
+    
+    if (offset_in_page % Seg->object_size != 0) {
+        pthread_mutex_unlock(&Seg->lock);
+        fprintf(stderr, "Error: free() misaligned pointer %p\n", Ptr);
+        return;
+    }
+
+    size_t slot_index = offset_in_page / Seg->object_size;
+    unsigned char *slot_bm = get_page_slot_bitmap(Seg, page_index);
+
+    if (!is_slot_used(slot_bm, slot_index)) {
+        pthread_mutex_unlock(&Seg->lock);
+        fprintf(stderr, "Error: double free detected at %p\n", Ptr);
+        return;
+    }
+
+    clear_slot_used(slot_bm, slot_index);
+    Seg->byte_map[page_index]++;
+    __sync_fetch_and_add(&NumBytesFreed, Seg->object_size);
+
+    if (Seg->byte_map[page_index] == Seg->objects_per_page) {
+        reclaimMemory(page_start, PAGE_SIZE);
+    }
+
+    pthread_mutex_unlock(&Seg->lock);
+    
+    static long long last_consolidation = 0;
+    if (NumBytesFreed - last_consolidation > 10 * 1024 * 1024) {
+        last_consolidation = NumBytesFreed;
+        
+        for (int cls = 0; cls < NUM_SIZE_CLASSES; cls++) {
+            if (Seg->object_size == SizeClasses[cls]) {
+                consolidate_size_class(cls);
+                break;
             }
         }
     }
 }
 
-void trigger_mremap_move(void *src_page, void *dst_page) {
-    void *res = mremap(src_page, PAGE_SIZE, PAGE_SIZE, MREMAP_MAYMOVE | MREMAP_FIXED, dst_page);
-    if (res == MAP_FAILED) {
-        return;
+void runGC() {
+    printf("Running manual garbage collection (consolidation)...\n");
+    for (int cls = 0; cls < NUM_SIZE_CLASSES; cls++) {
+        consolidate_size_class(cls);
     }
+    NumGCTriggered++;
 }
 
 void printMemoryStats() {
-    printf("Num Bytes Allocated: %lld\n", NumBytesAllocated);
-    printf("Num Bytes Freed: %lld\n", NumBytesFreed);
+    printf("\n=== Memory Allocator Statistics ===\n");
+    printf("Bytes Allocated: %lld\n", NumBytesAllocated);
+    printf("Bytes Freed:     %lld\n", NumBytesFreed);
+    printf("Bytes In Use:    %lld\n", NumBytesAllocated - NumBytesFreed);
+    
+    printf("\nSegments per size class:\n");
+    for (int cls = 0; cls < NUM_SIZE_CLASSES; cls++) {
+        int count = 0;
+        long long bytes_used = 0;
+        long long sparse_pages = 0;
+        long long empty_pages = 0;
+        
+        pthread_mutex_lock(&global_lock);
+        Segment *Seg = SizeClassSegments[cls];
+        pthread_mutex_unlock(&global_lock);
+        
+        while (Seg) {
+            count++;
+            pthread_mutex_lock(&Seg->lock);
+            for (size_t p = 0; p < Seg->num_data_pages; p++) {
+                size_t used = Seg->objects_per_page - Seg->byte_map[p];
+                bytes_used += used * Seg->object_size;
+                
+                if (Seg->byte_map[p] == Seg->objects_per_page) {
+                    empty_pages++;
+                } else if (Seg->byte_map[p] > 0) {
+                    sparse_pages++;
+                }
+            }
+            pthread_mutex_unlock(&Seg->lock);
+            Seg = Seg->Next;
+        }
+        
+        if (count > 0) {
+            printf("  %4zu bytes: %3d segments, %lld bytes in use, %lld sparse pages, %lld empty pages\n",
+                   SizeClasses[cls], count, bytes_used, sparse_pages, empty_pages);
+        }
+    }
 }
