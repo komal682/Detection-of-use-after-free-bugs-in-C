@@ -5,8 +5,8 @@ LDFLAGS = -L. -Wl,-rpath,. -lmemory -lpthread
 # Add rbtest to the default target so it builds automatically
 default: libmemory.so rbtest
 
-libmemory.so: memory.c mem.s
-	$(CC) -shared $(CFLAGS) -o libmemory.so mem.s memory.c -lpthread
+libmemory.so: memory.c
+	$(CC) -shared $(CFLAGS) -o libmemory.so memory.c -lpthread
 
 rbtest: rbtree_test.c libmemory.so
 	$(CC) $(CFLAGS) -o rbtest rbtree_test.c $(LDFLAGS)
