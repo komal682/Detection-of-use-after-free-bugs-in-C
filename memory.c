@@ -122,12 +122,12 @@ void *mymalloc(size_t size) {
     return obj;
 }
 
-if (!Ptr) return;
+void myfree(void *Ptr) {
+    if (!Ptr) return;
 
     Segment *Seg = ADDR_TO_SEGMENT(Ptr);
     char *page = ADDR_TO_PAGE(Ptr);
-    
-    void myfree(void *Ptr) {
+
     if (page < Seg->data_start || page >= Seg->data_end) {
         printf("Invalid free: %p\n", Ptr);
         return;
@@ -198,7 +198,7 @@ static void merge_pages(Segment *dst, Segment *src, size_t page_idx) {
     dst->page_byte_map[page_idx] += objects_moved;
     src->page_byte_map[page_idx] = 0;
     
-    
+    // reclaimMemory(src_page, PAGE_SIZE);
 }
 
 void runGC() {
