@@ -7,10 +7,10 @@
 
 #define SEGMENT_SIZE (4ULL << 30)   // 4GB
 #define PAGE_SIZE 4096
-#define OBJECT_SIZE 8
+#define MAX_OBJECT_SIZE 64
 
-#define OBJECTS_PER_PAGE (PAGE_SIZE / OBJECT_SIZE) // 512
-#define SLOT_BITMAP_SIZE (OBJECTS_PER_PAGE / 8)    // 64 bytes
+#define OBJECTS_PER_PAGE (PAGE_SIZE / MAX_OBJECT_SIZE)
+#define SLOT_BITMAP_SIZE (OBJECTS_PER_PAGE / 8)   // 64 bytes
 #define TOTAL_PAGES (SEGMENT_SIZE / PAGE_SIZE)
 
 #define Align(x, y) (((x) + (y-1)) & ~(y-1))
@@ -46,7 +46,7 @@ static void reclaimMemory(void *Ptr, size_t Size) {
     madvise(Ptr, Size, MADV_DONTNEED);
 }
 
-/* Allocate new segment */
+
 static Segment* allocateSegment() {
     void *Base = mmap(NULL, SEGMENT_SIZE * 2, PROT_NONE,
                       MAP_ANON | MAP_PRIVATE, -1, 0);
@@ -86,8 +86,12 @@ static Segment* allocateSegment() {
     return Seg;
 }
 
-/* Allocate 8 bytes */
 void *mymalloc(size_t size) {
+    if (size > MAX_OBJECT_SIZE) {
+        printf("Allocation too large: %zu bytes\n", size);
+        return NULL;
+    }
+
     if (!CurrentSegment || CurrentSegment->curr_page >= TOTAL_PAGES) {
         CurrentSegment = allocateSegment();
         if (!CurrentSegment) return NULL;
@@ -105,27 +109,25 @@ void *mymalloc(size_t size) {
     bm[s / 8] |= (1 << (s % 8));
     Seg->page_byte_map[p]++;
 
-    void *obj = page_start + s * OBJECT_SIZE;
-
-    memset(obj, 0, OBJECT_SIZE);
+    void *obj = page_start + s * MAX_OBJECT_SIZE;
+    memset(obj, 0, MAX_OBJECT_SIZE);
 
     Seg->curr_slot++;
-    if (Seg->curr_slot == OBJECTS_PER_PAGE) {
+    if (Seg->curr_slot == PAGE_SIZE / MAX_OBJECT_SIZE) {
         Seg->curr_slot = 0;
         Seg->curr_page++;
     }
 
-    NumBytesAllocated += OBJECT_SIZE;
+    NumBytesAllocated += MAX_OBJECT_SIZE;
     return obj;
 }
 
-/* Free object (no reuse) */
-void myfree(void *Ptr) {
-    if (!Ptr) return;
+if (!Ptr) return;
 
     Segment *Seg = ADDR_TO_SEGMENT(Ptr);
     char *page = ADDR_TO_PAGE(Ptr);
-
+    
+    void myfree(void *Ptr) {
     if (page < Seg->data_start || page >= Seg->data_end) {
         printf("Invalid free: %p\n", Ptr);
         return;
@@ -133,7 +135,7 @@ void myfree(void *Ptr) {
 
     size_t p = (page - Seg->data_start) / PAGE_SIZE;
     size_t offset = (char*)Ptr - page;
-    size_t slot = offset / OBJECT_SIZE;
+    size_t slot = offset / MAX_OBJECT_SIZE;
 
     unsigned char *bm = Seg->slot_bitmaps + p * SLOT_BITMAP_SIZE;
     if (!(bm[slot/8] & (1 << (slot%8)))) {
@@ -143,27 +145,27 @@ void myfree(void *Ptr) {
 
     bm[slot/8] &= ~(1 << (slot%8));
     Seg->page_byte_map[p]--;
-    NumBytesFreed += OBJECT_SIZE;
+    NumBytesFreed += MAX_OBJECT_SIZE;
 
     if (Seg->page_byte_map[p] == 0) {
         reclaimMemory(page, PAGE_SIZE);
     }
 }
 
-/* Check if two pages have overlapping slots */
+
 static int pages_have_overlap(Segment *dst, Segment *src, size_t page_idx) {
     unsigned char *dst_bm = dst->slot_bitmaps + page_idx * SLOT_BITMAP_SIZE;
     unsigned char *src_bm = src->slot_bitmaps + page_idx * SLOT_BITMAP_SIZE;
 
     for (size_t i = 0; i < SLOT_BITMAP_SIZE; i++) {
         if (dst_bm[i] & src_bm[i]) {
-            return 1;  // Conflict found
+            return 1; 
         }
     }
     return 0;
 }
 
-/* Merge page idx of src into dst */
+
 static void merge_pages(Segment *dst, Segment *src, size_t page_idx) {
     unsigned char *dst_bm = dst->slot_bitmaps + page_idx * SLOT_BITMAP_SIZE;
     unsigned char *src_bm = src->slot_bitmaps + page_idx * SLOT_BITMAP_SIZE;
@@ -171,7 +173,7 @@ static void merge_pages(Segment *dst, Segment *src, size_t page_idx) {
     char *dst_page = dst->data_start + page_idx * PAGE_SIZE;
     char *src_page = src->data_start + page_idx * PAGE_SIZE;
 
-    // Only allow access if pages have objects
+    
     if (dst->page_byte_map[page_idx] > 0) {
         allowAccess(dst_page, PAGE_SIZE);
     }
@@ -183,50 +185,43 @@ static void merge_pages(Segment *dst, Segment *src, size_t page_idx) {
 
     for (size_t i = 0; i < OBJECTS_PER_PAGE; i++) {
         if (src_bm[i/8] & (1 << (i%8))) {
-            memcpy(dst_page + i*OBJECT_SIZE,
-                   src_page + i*OBJECT_SIZE,
-                   OBJECT_SIZE);
+            memcpy(dst_page + i*MAX_OBJECT_SIZE,
+                    src_page + i*MAX_OBJECT_SIZE,
+                    MAX_OBJECT_SIZE);
             dst_bm[i/8] |= (1 << (i%8));
             src_bm[i/8] &= ~(1 << (i%8));
             objects_moved++;
         }
     }
 
-    // Update byte maps
+    
     dst->page_byte_map[page_idx] += objects_moved;
     src->page_byte_map[page_idx] = 0;
     
-    reclaimMemory(src_page, PAGE_SIZE);
+    
 }
 
-/* Garbage collection */
 void runGC() {
     Segment *A = SegmentList;
+
     while (A) {
         Segment *B = A->next;
+
         while (B) {
             for (size_t p = 0; p < TOTAL_PAGES; p++) {
-                // Skip if either page is empty or if merging would overflow
-                if (A->page_byte_map[p] == 0 && B->page_byte_map[p] == 0) {
+
+                // Skip empty pages
+                if (A->page_byte_map[p] == 0 || B->page_byte_map[p] == 0) {
                     continue;
                 }
-                
+
+                // Can we merge B into A?
                 if (A->page_byte_map[p] + B->page_byte_map[p] <= OBJECTS_PER_PAGE) {
-                    // Check for slot conflicts before merging
+
+                    // Only merge if slots do not overlap
                     if (!pages_have_overlap(A, B, p)) {
-                        merge_pages(A, B, p);
+                        // merge_pages(A, B, p);
                     }
-                    
-                    size_t moved = merge_pages(Seg, dst_idx, src_idx);
-                    total_objects_moved += moved;
-                    
-                    if (Seg->byte_map[src_idx] == Seg->objects_per_page) {
-                        char *src_page = Seg->data_start + (src_idx * PAGE_SIZE);
-                        reclaimMemory(src_page, PAGE_SIZE);
-                        pages_consolidated++;
-                    }
-                    
-                    break;
                 }
             }
             B = B->next;
