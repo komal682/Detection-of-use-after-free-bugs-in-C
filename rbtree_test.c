@@ -14,7 +14,7 @@ struct RBNode {
 typedef struct RBNode* Node;
 
 Node create_node(int data) {
-    Node n = (Node)mymalloc(sizeof(struct RBNode));
+    Node n = (Node)__wrap_malloc(sizeof(struct RBNode));
     if (n == NULL) {
         printf("Allocation failed!\n");
         exit(1);
@@ -111,7 +111,7 @@ void delete_tree(Node root) {
     if (root == NULL) return;
     delete_tree(root->left);
     delete_tree(root->right);
-    myfree(root);
+    __wrap_free(root);
 }
 
 int main(int argc, char *argv[]) {

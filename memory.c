@@ -24,6 +24,7 @@ typedef struct Segment {
     char *data_end;
     size_t curr_page;
     size_t curr_slot;
+		size_t slot_size;
     struct Segment *next;
 } Segment;
 
@@ -71,6 +72,7 @@ static Segment* allocateSegment() {
 
     Seg->data_start = SegmentStart + PAGE_SIZE;
     Seg->data_end = (char*)Seg->slot_bitmaps;
+		//Seg-slot_size = 
 
     allowAccess(Seg->slot_bitmaps, metadata_size);
 
@@ -86,7 +88,7 @@ static Segment* allocateSegment() {
     return Seg;
 }
 
-void *mymalloc(size_t size) {
+void *__wrap_malloc(size_t size) {
     if (size > MAX_OBJECT_SIZE) {
         printf("Allocation too large: %zu bytes\n", size);
         return NULL;
@@ -122,7 +124,29 @@ void *mymalloc(size_t size) {
     return obj;
 }
 
-void myfree(void *Ptr) {
+void *__wrap_calloc(size_t num, size_t size) {
+	void *ptr = __wrap_malloc(num*size);
+	memset(ptr, 0, num*size);
+	return ptr;
+}
+
+void *__wrap_realloc(void *ptr, size_t size) {
+#if 0
+	if (ptr == NULL) {
+		return __wrap_malloc(size);
+	}
+	//size_t old_size = (ADDR_TO_SEGMENT(ptr))->slot_size;
+	if (size <= old_size) {
+		return ptr;
+	}
+	void *ptr1 = __wrap_malloc(size);
+	//memcpy(ptr1, ptr, old_size);
+	return ptr1;
+#endif
+	return NULL;
+}
+
+void __wrap_free(void *Ptr) {
     if (!Ptr) return;
 
     Segment *Seg = ADDR_TO_SEGMENT(Ptr);
