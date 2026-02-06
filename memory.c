@@ -1,24 +1,24 @@
-
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <unistd.h>
 #include <stdint.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <assert.h>
 
 
 #define SEGMENT_SIZE (4ULL << 30)
 #define PAGE_SIZE 4096
 
-#define Align(x, y) (((x) + (y - 1)) & ~(y - 1))
+#define Align(x, y) (((x) + ((y) - 1)) & ~((y) - 1))
+
 #define ADDR_TO_PAGE(x) ((char *)((uintptr_t)(x) & ~(PAGE_SIZE - 1)))
+
 #define ADDR_TO_SEGMENT(x) ((Segment *)((uintptr_t)(x) & ~(SEGMENT_SIZE - 1)))
 
-
 long long NumBytesAllocated = 0;
-long long NumBytesFreed = 0;
-
+long long NumBytesFreed     = 0;
 
 static const size_t size_classes[] = {
     8, 16, 32, 64,
@@ -30,19 +30,19 @@ static const size_t size_classes[] = {
 
 
 typedef struct Segment {
-    size_t slot_size;
-    size_t objects_per_page;
+    size_t slot_size;            // size of each object
+    size_t objects_per_page;     // how many objects fit in one page
 
-    unsigned char *page_byte_map;
-    unsigned char *slot_bitmaps;
+    
+    uint64_t *slot_bitmap;
 
-    char *data_start;
-    char *data_end;
+    char *data_start;            // start of object pages
+    char *data_end;              // start of bitmap region
 
-    size_t curr_page;
-    size_t curr_slot;
+    size_t curr_page;            // current page for allocation
+    size_t curr_slot;            // current slot inside the page
 
-    struct Segment *next;
+    struct Segment *next;        // linked list
 } Segment;
 
 
@@ -87,17 +87,22 @@ static void bigalloc_remove(void *addr) {
     }
 }
 
+
 static void *big_alloc(size_t size) {
     size_t alloc_size = Align(size, PAGE_SIZE);
+
     void *ptr = mmap(NULL, alloc_size,
                      PROT_READ | PROT_WRITE,
                      MAP_ANON | MAP_PRIVATE, -1, 0);
-    if (ptr == MAP_FAILED) return NULL;
+
+    if (ptr == MAP_FAILED)
+        return NULL;
 
     bigalloc_insert(ptr, alloc_size);
     NumBytesAllocated += alloc_size;
     return ptr;
 }
+
 
 
 static Segment *SegmentLists[NUM_SIZE_CLASSES];
@@ -115,54 +120,54 @@ static void reclaimMemory(void *ptr, size_t size) {
 
 static int get_size_class(size_t size) {
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
-        if (size <= size_classes[i]) return i;
+        if (size <= size_classes[i])
+            return i;
     return -1;
 }
 
 
-
 static Segment *allocateSegment(size_t slot_size) {
-    void *base = mmap(NULL, SEGMENT_SIZE * 2, PROT_NONE,
+    void *base = mmap(NULL, SEGMENT_SIZE * 2,
+                      PROT_NONE,
                       MAP_ANON | MAP_PRIVATE, -1, 0);
-    if (base == MAP_FAILED) return NULL;
+    if (base == MAP_FAILED)
+        return NULL;
 
     Segment *seg = (Segment *)Align((uintptr_t)base, SEGMENT_SIZE);
-    allowAccess(seg, PAGE_SIZE);
+
+    allowAccess(seg, PAGE_SIZE); //accessing metadata page
+
     memset(seg, 0, sizeof(*seg));
 
     seg->slot_size = slot_size;
+
     seg->objects_per_page = PAGE_SIZE / slot_size;
 
     char *start = (char *)seg;
-    char *end = start + SEGMENT_SIZE;
+    char *end   = start + SEGMENT_SIZE;
 
-    size_t byte_map_size = Align(SEGMENT_SIZE / PAGE_SIZE, PAGE_SIZE);
-    size_t bitmap_size =
-        Align((SEGMENT_SIZE / PAGE_SIZE) * (seg->objects_per_page / 8), PAGE_SIZE);
+    size_t pages = SEGMENT_SIZE / PAGE_SIZE;
 
-    seg->slot_bitmaps = (unsigned char *)(end - (byte_map_size + bitmap_size));
-    seg->page_byte_map = seg->slot_bitmaps + bitmap_size;
+    size_t bitmap_size = Align(pages * sizeof(uint64_t), PAGE_SIZE);
+
+    seg->slot_bitmap = (uint64_t *)(end - bitmap_size); //bitmap is at the end of the segment
 
     seg->data_start = start + PAGE_SIZE;
-    seg->data_end = (char *)seg->slot_bitmaps;
 
-    allowAccess(seg->slot_bitmaps, byte_map_size + bitmap_size);
-    memset(seg->slot_bitmaps, 0, bitmap_size);
-    memset(seg->page_byte_map, 0, byte_map_size);
+    seg->data_end = (char *)seg->slot_bitmap;
+    allowAccess(seg->slot_bitmap, bitmap_size);
+    memset(seg->slot_bitmap, 0, bitmap_size);
 
     return seg;
 }
-
-
-
-void __wrap_free(void *ptr);
 
 void *__wrap_malloc(size_t size) {
     if (size > PAGE_SIZE)
         return big_alloc(size);
 
     int sc = get_size_class(size);
-    if (sc < 0) return NULL;
+    if (sc < 0)
+        return NULL;
 
     Segment *seg = CurrentSegments[sc];
     if (!seg) {
@@ -175,11 +180,12 @@ void *__wrap_malloc(size_t size) {
     char *page = seg->data_start + seg->curr_page * PAGE_SIZE;
     allowAccess(page, PAGE_SIZE);
 
-    size_t bitmap_size = seg->objects_per_page / 8;
-    unsigned char *bm = seg->slot_bitmaps + seg->curr_page * bitmap_size;
+    uint64_t *bm = &seg->slot_bitmap[seg->curr_page];
 
-    bm[seg->curr_slot / 8] |= 1 << (seg->curr_slot % 8);
-    seg->page_byte_map[seg->curr_page]++;
+    *bm |= (1ULL << seg->curr_slot); // allocate slot
+
+     
+    assert(*bm != 0); //page will not be empty after allocation
 
     void *obj = page + seg->curr_slot * seg->slot_size;
     memset(obj, 0, seg->slot_size);
@@ -187,21 +193,58 @@ void *__wrap_malloc(size_t size) {
     if (++seg->curr_slot == seg->objects_per_page) {
         seg->curr_slot = 0;
         seg->curr_page++;
-    }
+    } // moving to the next slot/page
 
     NumBytesAllocated += seg->slot_size;
     return obj;
 }
 
+void __wrap_free(void *ptr) {
+    if (!ptr)
+        return;
+
+    BigAlloc *ba = bigalloc_find(ptr);
+    if (ba) {
+        munmap(ptr, ba->size);
+        NumBytesFreed += ba->size;
+        bigalloc_remove(ptr);
+        return;
+    }
+
+    Segment *seg = ADDR_TO_SEGMENT(ptr);
+    char *page   = ADDR_TO_PAGE(ptr);
+
+    size_t p = (page - seg->data_start) / PAGE_SIZE;
+    size_t slot = ((char *)ptr - page) / seg->slot_size;
+
+    uint64_t *bm = &seg->slot_bitmap[p];
+
+    assert(*bm != 0); // page must be allocated if we are freeing
+
+    // /* ignore double free */
+    // if (!(*bm & (1ULL << slot)))
+    //     return;
+
+    *bm &= ~(1ULL << slot);
+    NumBytesFreed += seg->slot_size;
+
+    
+    if (*bm == 0) // if page becomes empty
+        reclaimMemory(page, PAGE_SIZE);
+}
+
 void *__wrap_calloc(size_t n, size_t size) {
     size_t total = n * size;
     void *p = __wrap_malloc(total);
-    if (p) memset(p, 0, total);
+    if (p)
+        memset(p, 0, total);
     return p;
 }
 
 void *__wrap_realloc(void *ptr, size_t size) {
-    if (!ptr) return __wrap_malloc(size);
+    if (!ptr)
+        return __wrap_malloc(size);
+
     if (size == 0) {
         __wrap_free(ptr);
         return NULL;
@@ -223,38 +266,6 @@ void *__wrap_realloc(void *ptr, size_t size) {
     return n;
 }
 
-void __wrap_free(void *ptr) {
-    if (!ptr) return;
-
-    BigAlloc *ba = bigalloc_find(ptr);
-    if (ba) {
-        munmap(ptr, ba->size);
-        NumBytesFreed += ba->size;
-        bigalloc_remove(ptr);
-        return;
-    }
-
-    Segment *seg = ADDR_TO_SEGMENT(ptr);
-    char *page = ADDR_TO_PAGE(ptr);
-
-    size_t p = (page - seg->data_start) / PAGE_SIZE;
-    size_t slot = ((char *)ptr - page) / seg->slot_size;
-
-    size_t bitmap_size = seg->objects_per_page / 8;
-    unsigned char *bm = seg->slot_bitmaps + p * bitmap_size;
-
-    if (!(bm[slot / 8] & (1 << (slot % 8))))
-        return;
-
-    bm[slot / 8] &= ~(1 << (slot % 8));
-    seg->page_byte_map[p]--;
-    NumBytesFreed += seg->slot_size;
-
-    if (seg->page_byte_map[p] == 0)
-        reclaimMemory(page, PAGE_SIZE);
-}
-
-
 
 void printMemoryStats() {
     printf("\n=== Memory Stats ===\n");
@@ -262,7 +273,6 @@ void printMemoryStats() {
     printf("Freed:     %lld\n", NumBytesFreed);
     printf("In Use:    %lld\n", NumBytesAllocated - NumBytesFreed);
 }
-
 
 void *malloc(size_t size)   __attribute__((alias("__wrap_malloc")));
 void free(void *ptr)        __attribute__((alias("__wrap_free")));
