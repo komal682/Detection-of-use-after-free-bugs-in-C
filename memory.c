@@ -44,7 +44,6 @@ static size_t NumBytesAllocated = 0;
 static size_t NumBytesFreed = 0;
 static size_t NumPagesReclaimed = 0;
 
-/* ── get_size_class ───────────────────────────────────────────────────────*/
 static int get_size_class(int size)
 {
     for (int i = 0; i < NUM_OBJ_SIZES; i++)
@@ -53,11 +52,6 @@ static int get_size_class(int size)
     return -1;
 }
 
-/* ── big-alloc hash table ─────────────────────────────────────────────────
- * Allocations larger than PAGE_SIZE bypass the slab entirely and go
- * straight to mmap. We track them in a hash table keyed by address so
- * __wrap_free can identify and munmap them.
- * --------------------------------------------------------------------------*/
 static size_t bigalloc_hash(void *addr)
 {
     return ((uintptr_t)addr >> 12) % BIGALLOC_HASH_SIZE;
@@ -66,8 +60,7 @@ static size_t bigalloc_hash(void *addr)
 static void bigalloc_insert(void *addr, size_t size)
 {
     size_t h = bigalloc_hash(addr);
-    /* mmap requires a page-aligned length; sizeof(BigAlloc) is only 24 bytes.
-     * munmap with a sub-page size causes SIGABRT on some systems. */
+    /* mmap requires a page-aligned length; sizeof(BigAlloc) is only 24 bytes.*/
     BigAlloc *n = mmap(NULL, PAGE_SIZE,
                        PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     if (n == MAP_FAILED)
@@ -115,16 +108,12 @@ static void *big_alloc(size_t size)
     return ptr;
 }
 
-/* ── allocateSeg ──────────────────────────────────────────────────────────
- * Reserves a 4 GiB-aligned slab segment and carves the tail into a bitmap
- * and a page_objfree_count array.
- *
- * Memory layout inside the segment (low → high):
- *   [  header  PAGE_SIZE  ]  ← Segment struct lives here
- *   [  object data        ]  ← data_start .. data_end
- *   [  page_objfree_count    ]  ← pfc_bytes, page-aligned
- *   [  bitmap             ]  ← bm_bytes,  page-aligned
- * --------------------------------------------------------------------------*/
+// Memory layout inside the segment (low → high):
+// [  header  PAGE_SIZE  ]  ← Segment struct lives here
+// [  object data        ]  ← data_start .. data_end
+// [  page_objfree_count    ]  ← pfc_bytes, page-aligned
+// [  bitmap             ]  ← bm_bytes,  page-aligned
+
 static Segment *allocateSeg(int size)
 {
     void *addrs = mmap(NULL, SEG_SIZE * 2,
@@ -165,133 +154,112 @@ static Segment *allocateSeg(int size)
     return seg;
 }
 
-/* ---------------------------------------------------------
-   Merge two pages from two segments (same size class)
-   --------------------------------------------------------- */
-static void merge_pages(Segment *segA, size_t pageA, Segment *segB, size_t pageB)
+static void merge_pages(Segment *A, size_t pA,
+                        Segment *B, size_t pB)
 {
+    int opp = A->obj_per_page;
 
-    int opp = segA->obj_per_page;
+    size_t baseA = pA * opp;
+    size_t baseB = pB * opp;
 
-    /* count live objects */
-    int liveA = opp - segA->page_objfree_count[pageA];
-    int liveB = opp - segB->page_objfree_count[pageB];
+    size_t startA = baseA / 64;
+    size_t startB = baseB / 64;
 
-    if (liveA == 0 || liveB == 0)
-        return;
+    size_t words = (opp + 63) / 64;
 
-    if (liveA + liveB > opp)
-        return;
-
-    /* choose smaller page as source */
-    Segment *src = (liveA <= liveB) ? segA : segB;
-    Segment *dst = (src == segA) ? segB : segA;
-    size_t src_pg = (src == segA) ? pageA : pageB;
-    size_t dst_pg = (src == segA) ? pageB : pageA;
-
-    for (int i = 0; i < opp; i++)
+    // Check overlap
+    for (size_t w = 0; w < words; w++)
     {
-        int src_slot = src_pg * opp + i;
+        if (A->bitmap[startA + w] &
+            B->bitmap[startB + w])
+            return;
+    }
+    printf("MERGE: SegmentA %p Page %zu  -->  SegmentB %p Page %zu\n",
+        (void*)A, pA, (void*)B, pB);
 
-        if (!(src->bitmap[src_slot / 64] &
-              (1ULL << (src_slot % 64))))
-            continue;
+    // Merge exact positions
+    for (size_t i = 0; i < opp; i++)
+    {
+        size_t slotA = baseA + i;
+        size_t slotB = baseB + i;
 
-        /* find free slot in dst */
-        for (int j = 0; j < opp; j++)
+        if (A->bitmap[slotA / 64] &
+            (1ULL << (slotA % 64)))
         {
-            int dst_slot = dst_pg * opp + j;
-
-            if (!(dst->bitmap[dst_slot / 64] &
-                  (1ULL << (dst_slot % 64))))
-            {
-                memcpy(
-                    dst->data_start +
-                        (size_t)dst_slot * dst->object_size,
-                    src->data_start +
-                        (size_t)src_slot * src->object_size,
-                    src->object_size);
-
-                src->bitmap[src_slot / 64] &=
-                    ~(1ULL << (src_slot % 64));
-                dst->bitmap[dst_slot / 64] |=
-                    (1ULL << (dst_slot % 64));
-
-                src->page_objfree_count[src_pg]++;
-                dst->page_objfree_count[dst_pg]--;
-
-                break;
-            }
+            memcpy(B->data_start +
+                       slotB * B->object_size,
+                   A->data_start +
+                       slotA * A->object_size,
+                   A->object_size);
         }
     }
 
-    /* reclaim source page if empty */
-    if (src->page_objfree_count[src_pg] == opp)
+    // Update bitmap
+    for (size_t w = 0; w < words; w++)
     {
-        void *page_base =
-            src->data_start + src_pg * PAGE_SIZE;
+        B->bitmap[startB + w] |=
+            A->bitmap[startA + w];
 
-        madvise(page_base, PAGE_SIZE, MADV_FREE);
-        NumPagesReclaimed++;
+        A->bitmap[startA + w] = 0;
+    }
+
+    int live = 0;
+    for (size_t w = 0; w < words; w++)
+    {
+        live += __builtin_popcountll(
+            B->bitmap[startB + w]);
+    }
+    B->page_objfree_count[pB] = opp - live;
+
+    void *page_base =
+        A->data_start + pA * PAGE_SIZE;
+
+    munmap(page_base, PAGE_SIZE);
+
+    NumPagesReclaimed++;
+}
+
+static void brute_force_merge(int sc)
+{
+    Segment *segA = seg_list[sc];
+
+    while (segA)
+    {
+        size_t pagesA =
+            (segA->data_end - segA->data_start) / PAGE_SIZE;
+
+        Segment *segB = segA->next;
+
+        while (segB)
+        {
+            size_t pagesB =
+                (segB->data_end - segB->data_start) / PAGE_SIZE;
+
+            for (size_t pA = 0; pA < pagesA; pA++)
+            {
+                /* Skip empty pages */
+                if (segA->page_objfree_count[pA] ==
+                    segA->obj_per_page)
+                    continue;
+
+                for (size_t pB = 0; pB < pagesB; pB++)
+                {
+                    if (segB->page_objfree_count[pB] ==
+                        segB->obj_per_page)
+                        continue;
+
+                    merge_pages(segA, pA,
+                                segB, pB);
+                }
+            }
+
+            segB = segB->next;
+        }
+
+        segA = segA->next;
     }
 }
 
-/* ---------------------------------------------------------
-   Brute force segment-vs-segment merge
-   --------------------------------------------------------- */
-   static void brute_force_merge(int sc)
-   {
-       Segment *segA = seg_list[sc];
-   
-       while (segA)
-       {
-           size_t pagesA =
-               (segA->data_end - segA->data_start) / PAGE_SIZE;
-   
-           Segment *segB = segA->next;
-   
-           while (segB)
-           {
-               size_t pagesB =
-                   (segB->data_end - segB->data_start) / PAGE_SIZE;
-   
-               int threshold = segA->obj_per_page / 4;
-               if (threshold < 1) threshold = 1;
-   
-               for (size_t pA = 0; pA < pagesA; pA++)
-               {
-                   /* Skip empty pages */
-                   if (segA->page_objfree_count[pA] ==
-                       segA->obj_per_page)
-                       continue;
-   
-                   /* 25% free threshold */
-                   if (segA->page_objfree_count[pA] < threshold)
-                       continue;
-   
-                   for (size_t pB = 0; pB < pagesB; pB++)
-                   {
-                       if (segB->page_objfree_count[pB] ==
-                           segB->obj_per_page)
-                           continue;
-   
-                       if (segB->page_objfree_count[pB] < threshold)
-                           continue;
-   
-                       merge_pages(segA, pA,
-                                   segB, pB);
-                   }
-               }
-   
-               segB = segB->next;
-           }
-   
-           segA = segA->next;
-       }
-   }
-   
-
-/* ── __wrap_malloc ────────────────────────────────────────────────────────*/
 void *__wrap_malloc(size_t size)
 {
     if (size == 0)
@@ -341,7 +309,6 @@ void *__wrap_malloc(size_t size)
     return obj;
 }
 
-/* ── __wrap_free ──────────────────────────────────────────────────────────*/
 void __wrap_free(void *ptr)
 {
     if (!ptr)
@@ -358,10 +325,6 @@ void __wrap_free(void *ptr)
 
     Segment *seg = (Segment *)((uintptr_t)ptr & ~(SEG_SIZE - 1));
 
-    /* Validate this pointer actually came from one of our segments.
-     * When the malloc alias intercepts libc-internal free() calls for
-     * pointers we never allocated, seg->base will not equal seg itself.
-     * Silently ignore such pointers rather than corrupting random memory. */
     if (seg->base != (void *)seg)
         return;
 
@@ -381,17 +344,10 @@ void __wrap_free(void *ptr)
     {
         void *page_base = seg->data_start + page_idx * PAGE_SIZE;
         madvise(page_base, PAGE_SIZE, MADV_FREE);
+        // munmap(page_base, PAGE_SIZE);
         NumPagesReclaimed++;
     }
 
-    /* BUG FIX — saturating subtraction.
-     *
-     * After compact_size_class moves live objects out of a sparse page and
-     * madvises it, NumPagesReclaimed * PAGE_SIZE can exceed NumBytesFreed
-     * (the moved page contributed only its *dead* slots to NumBytesFreed, not
-     * the live slot that was evacuated). A raw unsigned subtraction wraps to
-     * ~SIZE_MAX, instantly re-fires compaction, and stack-overflows.
-     * The ternary clamps the result to 0 instead. */
     size_t reclaimed_bytes = NumPagesReclaimed * PAGE_SIZE;
     size_t frag_bytes = (NumBytesFreed > reclaimed_bytes)
                             ? NumBytesFreed - reclaimed_bytes
@@ -405,25 +361,6 @@ void __wrap_free(void *ptr)
     }
 }
 
-/* ══════════════════════════════════════════════════════════════════════════
- * compact_size_class
- *
- * For every segment in size class sc, scan pages from the HIGH end toward
- * the front. Any page with >= 25% free slots is a compaction candidate.
- * Live objects on that page are memcpy'd into the earliest page that still
- * has room (safe because the allocator guarantees no external pointers into
- * slab memory). Once a page is fully evacuated it is returned to the OS via
- * madvise(MADV_FREE) and NumPagesReclaimed is incremented.
- *
- * Helpers:
- *   find_free_slot — first bitmap-0 slot on a page, or -1
- *   find_live_slot — first bitmap-1 slot on a page, or -1
- *   move_object    — memcpy + bitmap update + page_objfree_count update
- *
- * Complexity: O(active_pages²) per segment — acceptable for Model 0.
- * ══════════════════════════════════════════════════════════════════════════*/
-
-/* ── __wrap_calloc ────────────────────────────────────────────────────────*/
 void *__wrap_calloc(size_t n, size_t size)
 {
     size_t total = n * size;
@@ -433,7 +370,6 @@ void *__wrap_calloc(size_t n, size_t size)
     return p;
 }
 
-/* ── __wrap_realloc ───────────────────────────────────────────────────────*/
 void *__wrap_realloc(void *ptr, size_t size)
 {
     if (!ptr)
@@ -448,7 +384,7 @@ void *__wrap_realloc(void *ptr, size_t size)
     if (big)
     {
         if (size <= big->size)
-            return ptr; /* still fits */
+            return ptr;
         void *np = __wrap_malloc(size);
         if (!np)
             return NULL;
@@ -459,7 +395,7 @@ void *__wrap_realloc(void *ptr, size_t size)
 
     Segment *seg = (Segment *)((uintptr_t)ptr & ~(SEG_SIZE - 1));
     if (seg->base != (void *)seg)
-        return NULL; /* not our pointer */
+        return NULL;
     int sc = get_size_class(size);
     if (sc < 0)
         return NULL;
@@ -468,7 +404,7 @@ void *__wrap_realloc(void *ptr, size_t size)
     size_t old_size = (size_t)seg->object_size;
 
     if (new_size <= old_size)
-        return ptr; /* fits in same size class */
+        return ptr;
 
     void *np = __wrap_malloc(new_size);
     if (!np)
