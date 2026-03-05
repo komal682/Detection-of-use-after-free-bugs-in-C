@@ -1,4 +1,8 @@
 #define _GNU_SOURCE
+#include <sys/syscall.h>
+#include <linux/memfd.h>
+#include <fcntl.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,7 +72,6 @@ static size_t bigalloc_hash(void *addr)
 static void bigalloc_insert(void *addr, size_t size)
 {
     size_t h = bigalloc_hash(addr);
-    /* mmap requires a page-aligned length; sizeof(BigAlloc) is only 24 bytes.*/
     BigAlloc *n = mmap(NULL, PAGE_SIZE,
                        PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     if (n == MAP_FAILED)
@@ -116,11 +119,7 @@ static void *big_alloc(size_t size)
     return ptr;
 }
 
-// Memory layout inside the segment (low → high):
-// [  header  PAGE_SIZE  ]  ← Segment struct lives here
-// [  object data        ]  ← data_start .. data_end
-// [  page_objfree_count    ]  ← pfc_bytes, page-aligned
-// [  bitmap             ]  ← bm_bytes,  page-aligned
+
 
 static Segment *allocateSeg(int size)
 {
@@ -194,8 +193,7 @@ static void remove_global_page(int sc, Segment *seg, size_t page_idx)
     }
 }
 
-static void merge_pages(Segment *A, size_t pA,
-                        Segment *B, size_t pB)
+static int merge_pages(Segment *A, size_t pA, Segment *B, size_t pB)
 {
     int opp = A->obj_per_page;
 
@@ -212,7 +210,7 @@ static void merge_pages(Segment *A, size_t pA,
     {
         if (A->bitmap[startA + w] &
             B->bitmap[startB + w])
-            return;
+            return 0;
     }
     printf("MERGE: SegmentA %p Page %zu  -->  SegmentB %p Page %zu\n",
            (void *)A, pA, (void *)B, pB);
@@ -233,30 +231,73 @@ static void merge_pages(Segment *A, size_t pA,
         }
     }
 
-    // Update bitmap
+    int liveA = 0;
+    int liveB = 0;
+
     for (size_t w = 0; w < words; w++)
     {
-        B->bitmap[startB + w] |=
-            A->bitmap[startA + w];
-
-        A->bitmap[startA + w] = 0;
+        liveA += __builtin_popcountll(A->bitmap[startA + w]);
+        liveB += __builtin_popcountll(B->bitmap[startB + w]);
     }
 
-    int live = 0;
-    for (size_t w = 0; w < words; w++)
-    {
-        live += __builtin_popcountll(
-            B->bitmap[startB + w]);
-    }
-    B->page_objfree_count[pB] = opp - live;
+    int total_live = liveA + liveB;
+
+    B->page_objfree_count[pB] = opp - total_live;
     A->page_objfree_count[pA] = opp;
 
-    void *page_base =
-        A->data_start + pA * PAGE_SIZE;
+    void *pageA = A->data_start + pA * PAGE_SIZE;
+    void *pageB = B->data_start + pB * PAGE_SIZE;
 
-    munmap(page_base, PAGE_SIZE);
+    int fd = syscall(SYS_memfd_create, "merge_page", 0);
+    if (fd < 0)
+        return 0;
+
+    if (ftruncate(fd, PAGE_SIZE) != 0)
+    {
+        close(fd);
+        return 0;
+    }
+
+    void *tmp = mmap(NULL, PAGE_SIZE,
+                     PROT_READ | PROT_WRITE,
+                     MAP_SHARED,
+                     fd, 0);
+
+    if (tmp == MAP_FAILED)
+    {
+        close(fd);
+        return 0;
+    }
+
+    memcpy(tmp, pageB, PAGE_SIZE);
+
+    munmap(tmp, PAGE_SIZE);
+
+    if (mmap(pageB,
+             PAGE_SIZE,
+             PROT_READ | PROT_WRITE,
+             MAP_SHARED | MAP_FIXED,
+             fd, 0) == MAP_FAILED)
+    {
+        close(fd);
+        return 0;
+    }
+
+    if (mmap(pageA,
+             PAGE_SIZE,
+             PROT_READ | PROT_WRITE,
+             MAP_SHARED | MAP_FIXED,
+             fd, 0) == MAP_FAILED)
+    {
+        close(fd);
+        return 0;
+    }
+    printf("shared mapping: A = %p B = %p\n", pageA, pageB);
+
+    close(fd);
 
     NumPagesReclaimed++;
+    return 1;
 }
 
 static void brute_force_merge(int sc)
@@ -271,29 +312,49 @@ static void brute_force_merge(int sc)
 
         while (nodeB)
         {
-            if (nodeA->seg != nodeB->seg)
+            int liveA = nodeA->seg->obj_per_page -
+                        nodeA->seg->page_objfree_count[nodeA->page_index];
+
+            int liveB = nodeB->seg->obj_per_page -
+                        nodeB->seg->page_objfree_count[nodeB->page_index];
+
+            if (liveA + liveB > nodeA->seg->obj_per_page)
             {
-                merge_pages(nodeA->seg, nodeA->page_index, nodeB->seg, nodeB->page_index);
-
-                if (nodeA->seg->page_objfree_count[nodeA->page_index] == nodeA->seg->obj_per_page)
-                {
-                    GlobalPageNode *to_delete = nodeA;
-
-                    if (prevA)
-                        prevA->next = nodeA->next;
-                    else
-                        global_page_list[sc] = nodeA->next;
-
-                    nodeA = nodeA->next;
-
-                    munmap(to_delete, sizeof(GlobalPageNode));
-
-                    removedA = 1;
-                    break;
-                }
+                nodeB = nodeB->next;
+                continue;
             }
 
-            nodeB = nodeB->next;
+            GlobalPageNode *nextB = nodeB->next;
+
+            int merged = merge_pages(nodeA->seg, nodeA->page_index,
+                                     nodeB->seg, nodeB->page_index);
+
+            if (merged == 0)
+            {
+                nodeB = nextB;
+                continue;
+            }
+
+            remove_global_page(sc, nodeB->seg, nodeB->page_index);
+            nodeB = nextB;
+
+            if (nodeA->seg->page_objfree_count[nodeA->page_index] ==
+                nodeA->seg->obj_per_page)
+            {
+                GlobalPageNode *to_delete = nodeA;
+
+                if (prevA)
+                    prevA->next = nodeA->next;
+                else
+                    global_page_list[sc] = nodeA->next;
+
+                nodeA = nodeA->next;
+
+                munmap(to_delete, sizeof(GlobalPageNode));
+
+                removedA = 1;
+                break;
+            }
         }
 
         if (!removedA)
@@ -306,7 +367,7 @@ static void brute_force_merge(int sc)
 
 void *__wrap_malloc(size_t size)
 {
-    printf("Wrap mallocs");
+    // printf("Wrap mallocs");
     if (size == 0)
         return NULL;
     if (size > PAGE_SIZE)
@@ -328,7 +389,6 @@ void *__wrap_malloc(size_t size)
 
     char *obj = seg->data_start + seg->alloc_idx * seg->object_size;
 
-    /* segment full — prepend a fresh one */
     if (obj + seg->object_size > seg->data_end)
     {
         Segment *new_seg = allocateSeg(size_classes[sc]);
@@ -340,12 +400,10 @@ void *__wrap_malloc(size_t size)
         obj = seg->data_start + seg->alloc_idx * seg->object_size;
     }
 
-    /* mark slot live in bitmap */
     size_t wi = seg->alloc_idx / 64;
     size_t bi = seg->alloc_idx % 64;
     seg->bitmap[wi] |= (1ULL << bi);
 
-    /* one fewer free slot on this page */
     size_t page_idx = (size_t)(obj - seg->data_start) / PAGE_SIZE;
     // if page was free before allocated
     if (seg->page_objfree_count[page_idx] == seg->obj_per_page)
@@ -356,7 +414,8 @@ void *__wrap_malloc(size_t size)
 
     seg->alloc_idx++;
     NumBytesAllocated += seg->object_size;
-    printf("Wrap mallocs");
+
+    // printf("Wrap mallocs");
     return obj;
 }
 
@@ -413,7 +472,7 @@ void __wrap_free(void *ptr)
         if (sc >= 0)
             brute_force_merge(sc);
     }
-    printf("Wrap free");
+    // printf("Wrap free");
 }
 
 void *__wrap_calloc(size_t n, size_t size)
@@ -469,7 +528,6 @@ void *__wrap_realloc(void *ptr, size_t size)
     return np;
 }
 
-/* ── printMemoryStats ─────────────────────────────────────────────────────*/
 void printMemoryStats(void)
 {
     printf("\n=== Memory Stats ===\n");
@@ -480,7 +538,6 @@ void printMemoryStats(void)
     printf("In Use:          %zu\n", NumBytesAllocated - NumBytesFreed);
 }
 
-/* ── libc aliases ─────────────────────────────────────────────────────────*/
 void *malloc(size_t size) __attribute__((alias("__wrap_malloc")));
 void free(void *ptr) __attribute__((alias("__wrap_free")));
 void *realloc(void *p, size_t s) __attribute__((alias("__wrap_realloc")));
