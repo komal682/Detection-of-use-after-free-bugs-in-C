@@ -10,4 +10,9 @@ void *__wrap_calloc(size_t nmemb, size_t size);
 void printMemoryStats();     // Defined in memory.c
 void runGC();                // Defined in mem.s
 
+#define mymalloc  __wrap_malloc
+#define myfree    __wrap_free
+#define mycalloc  __wrap_calloc
+#define myrealloc __wrap_realloc
+
 #endif
