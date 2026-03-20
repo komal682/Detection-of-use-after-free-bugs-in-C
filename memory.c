@@ -30,6 +30,7 @@ typedef struct Segment
     int object_size;
     int obj_per_page;
     uint16_t *page_objfree_count;
+    uint16_t *page_alloc_count;
     struct Segment *next;
 } Segment;
 
@@ -119,8 +120,6 @@ static void *big_alloc(size_t size)
     return ptr;
 }
 
-
-
 static Segment *allocateSeg(int size)
 {
     void *addrs = mmap(NULL, SEG_SIZE * 2,
@@ -145,16 +144,24 @@ static Segment *allocateSeg(int size)
     size_t bm_bytes = ALIGN((total_objs + 7) / 8, PAGE_SIZE);
     int bm_pages = bm_bytes / PAGE_SIZE;
 
-    size_t pfc_bytes = ALIGN((seg_pages - bm_pages) * sizeof(uint16_t), PAGE_SIZE);
+    size_t num_pages = seg_pages - bm_pages;
+
+    size_t pfc_bytes = ALIGN(num_pages * sizeof(uint16_t), PAGE_SIZE);
+    size_t pac_bytes = ALIGN(num_pages * sizeof(uint16_t), PAGE_SIZE);
 
     seg->bitmap = (unsigned long long *)((char *)seg + SEG_SIZE - bm_bytes);
-    seg->page_objfree_count = (uint16_t *)((char *)seg->bitmap - pfc_bytes);
+
+    seg->page_alloc_count = (uint16_t *)((char *)seg->bitmap - pac_bytes);
+    seg->page_objfree_count = (uint16_t *)((char *)seg->page_alloc_count - pfc_bytes);
+
     seg->data_end = (char *)seg->page_objfree_count;
 
     memset(seg->bitmap, 0, bm_bytes);
-
-    for (size_t p = 0; p < seg_pages - bm_pages; p++)
+    for (size_t p = 0; p < num_pages; p++)
+    {
         seg->page_objfree_count[p] = (uint16_t)seg->obj_per_page;
+        seg->page_alloc_count[p] = 0;
+    }
 
     seg->alloc_idx = 0;
     seg->next = NULL;
@@ -205,7 +212,7 @@ static int merge_pages(Segment *A, size_t pA, Segment *B, size_t pB)
 
     size_t words = (opp + 63) / 64;
 
-    // Check overlap
+    // Checking overlap
     for (size_t w = 0; w < words; w++)
     {
         if (A->bitmap[startA + w] &
@@ -231,19 +238,19 @@ static int merge_pages(Segment *A, size_t pA, Segment *B, size_t pB)
         }
     }
 
-    int liveA = 0;
-    int liveB = 0;
+    // int liveA = 0;
+    // int liveB = 0;
 
-    for (size_t w = 0; w < words; w++)
-    {
-        liveA += __builtin_popcountll(A->bitmap[startA + w]);
-        liveB += __builtin_popcountll(B->bitmap[startB + w]);
-    }
+    // for (size_t w = 0; w < words; w++)
+    // {
+    //     liveA += __builtin_popcountll(A->bitmap[startA + w]);
+    //     liveB += __builtin_popcountll(B->bitmap[startB + w]);
+    // }
 
-    int total_live = liveA + liveB;
+    // int total_live = liveA + liveB;
 
-    B->page_objfree_count[pB] = opp - total_live;
-    A->page_objfree_count[pA] = opp;
+    // B->page_objfree_count[pB] = opp - total_live;
+    // A->page_objfree_count[pA] = opp;
 
     void *pageA = A->data_start + pA * PAGE_SIZE;
     void *pageB = B->data_start + pB * PAGE_SIZE;
@@ -405,12 +412,20 @@ void *__wrap_malloc(size_t size)
     seg->bitmap[wi] |= (1ULL << bi);
 
     size_t page_idx = (size_t)(obj - seg->data_start) / PAGE_SIZE;
+    
     // if page was free before allocated
-    if (seg->page_objfree_count[page_idx] == seg->obj_per_page)
+    GlobalPageNode *tmp = global_page_list[sc];
+    while (tmp)
     {
-        add_global_page(sc, seg, page_idx);
+        if (tmp->seg == seg && tmp->page_index == page_idx)
+            break;
+        tmp = tmp->next;
     }
+    if (!tmp)
+        add_global_page(sc, seg, page_idx);
+
     seg->page_objfree_count[page_idx]--;
+    seg->page_alloc_count[page_idx]++;
 
     seg->alloc_idx++;
     NumBytesAllocated += seg->object_size;
@@ -450,15 +465,19 @@ void __wrap_free(void *ptr)
     size_t page_idx = ((char *)ptr - seg->data_start) / PAGE_SIZE;
     seg->page_objfree_count[page_idx]++;
 
-    if (seg->page_objfree_count[page_idx] == (uint16_t)seg->obj_per_page)
+    if (seg->page_objfree_count[page_idx] == seg->obj_per_page)
     {
         int sc = get_size_class(seg->object_size);
+
         remove_global_page(sc, seg, page_idx);
 
-        void *page_base = seg->data_start + page_idx * PAGE_SIZE;
-        madvise(page_base, PAGE_SIZE, MADV_FREE);
-        // munmap(page_base, PAGE_SIZE);
-        NumPagesReclaimed++;
+        if (seg->page_alloc_count[page_idx] == seg->obj_per_page)
+        {
+            void *page_base = seg->data_start + page_idx * PAGE_SIZE;
+            // madvise(page_base, PAGE_SIZE, MADV_FREE);
+            munmap(page_base, PAGE_SIZE);
+            NumPagesReclaimed++;
+        }
     }
 
     size_t reclaimed_bytes = NumPagesReclaimed * PAGE_SIZE;
